@@ -1,0 +1,630 @@
+"""
+Agent Core: reusable, thread-safe agent with persistent memory and dynamic tools.
+"""
+import datetime
+import importlib
+import json
+import logging
+import os
+import sqlite3
+import threading
+from collections import deque
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Dict, List, Any, Optional
+
+from openai import OpenAI
+
+# ==================== Memory ====================
+
+DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT,
+    tool_calls TEXT,      -- JSON array of tool_calls (from assistant)
+    tool_call_id TEXT,    -- for tool response messages
+    tool_name TEXT,       -- tool name for tool responses
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_session ON messages(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_id ON messages(session_id, id);
+"""
+
+class Memory:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.executescript(DB_SCHEMA)
+        self.conn.commit()
+
+    def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str = None,
+        tool_calls: Optional[List[Dict]] = None,
+        tool_call_id: str = None,
+        tool_name: str = None
+    ):
+        self.conn.execute(
+            """
+            INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, tool_name)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                role,
+                content,
+                json.dumps(tool_calls) if tool_calls else None,
+                tool_call_id,
+                tool_name
+            )
+        )
+        self.conn.commit()
+
+    def clear_history(self, session_id: str):
+        """Delete all messages for a given session."""
+        self.conn.execute(
+            "DELETE FROM messages WHERE session_id = ?",
+            (session_id,)
+        )
+        self.conn.commit()
+
+    def get_history(self, session_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        cur = self.conn.execute(
+            """
+            SELECT role, content, tool_calls, tool_call_id, tool_name
+            FROM messages
+            WHERE session_id = ?
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (session_id, limit)
+        )
+        messages = []
+        for role, content, tool_calls_json, tool_call_id, tool_name in cur.fetchall():
+            msg: Dict[str, Any] = {"role": role, "content": content or ""}
+            if tool_calls_json:
+                try:
+                    msg["tool_calls"] = json.loads(tool_calls_json)
+                except json.JSONDecodeError:
+                    pass
+            if tool_call_id:
+                msg["tool_call_id"] = tool_call_id
+                # store name for convenience (not part of OpenAI API but useful for us)
+                if tool_name:
+                    msg["name"] = tool_name
+            messages.append(msg)
+        return messages
+
+    def close(self):
+        self.conn.close()
+
+
+# ==================== Tool Loading ====================
+
+def load_tools(tools_dir: str) -> Dict[str, Dict]:
+    """Load tool modules from tools_dir.
+
+    Supports two patterns:
+
+    1. Single tool module:
+       - defines `tool_spec` (dict) and `run` (callable)
+
+    2. Multi-tool module:
+       - defines `tool_specs` (list of spec dicts) and `tools` (dict: name -> run)
+
+    Returns: name -> { "spec": tool_spec, "run": callable }
+    """
+    tools_path = Path(tools_dir)
+    if not tools_path.exists():
+        print(f"[Warning] Tools directory not found: {tools_dir}. No tools loaded.")
+        return {}
+    tools: Dict[str, Dict] = {}
+    for file in tools_path.glob("*.py"):
+        if file.name.startswith("_"):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(file.stem, file)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            # Pattern 1
+            if hasattr(mod, "tool_spec") and hasattr(mod, "run"):
+                name = mod.tool_spec["name"]
+                tools[name] = {"spec": mod.tool_spec, "run": mod.run}
+            # Pattern 2
+            elif hasattr(mod, "tool_specs") and hasattr(mod, "tools"):
+                for tspec in mod.tool_specs:
+                    name = tspec["name"]
+                    if name in mod.tools:
+                        tools[name] = {"spec": tspec, "run": mod.tools[name]}
+                    else:
+                        print(f"[Warning] tool spec {name} missing in tools dict in {file.name}")
+            else:
+                print(f"[Warning] Skipping {file.name}: missing tool_spec/run or tool_specs/tools")
+        except Exception as e:
+            print(f"[Error] Failed to load tool {file.name}: {e}")
+    return tools
+
+def build_openai_tools(tools_dict: Dict[str, Dict]) -> List[Dict]:
+    """Convert loaded tools to OpenAI function calling format."""
+    return [{"type": "function", "function": t["spec"]} for t in tools_dict.values()]
+
+
+# ==================== Agent ====================
+
+class Agent:
+    def __init__(self, config_path: str):
+        self.config_path = config_path
+        self.lock = threading.RLock()
+        self.logger = None  # will be set in _init_components
+        with self.lock:
+            self.config = self._load_config()
+            self._init_components()
+            self._log("Agent started")
+
+    def _load_config(self) -> dict:
+        if not os.path.exists(self.config_path):
+            raise FileNotFoundError(f"Config not found: {self.config_path}")
+        with open(self.config_path) as f:
+            cfg = json.load(f)
+        # Defaults
+        cfg.setdefault("base_url", "https://api.openai.com/v1")
+        cfg.setdefault("model", "gpt-4o-mini")
+        cfg.setdefault("db_path", os.path.join(os.path.dirname(self.config_path), "picolo.db"))
+        cfg.setdefault("tools_dir", os.path.join(os.path.dirname(self.config_path), "tools"))
+        cfg.setdefault("session_id", "default")
+        cfg.setdefault("system_prompt", None)
+        cfg.setdefault("context_limit", 100)  # max messages to include in prompt
+        cfg.setdefault("log_file", os.path.join(os.path.dirname(self.config_path), "picolo.log"))
+        cfg.setdefault("log_max_size", 5 * 1024 * 1024)  # 5 MB
+        cfg.setdefault("log_backup_count", 3)
+        return cfg
+
+    def _setup_logger(self):
+        """Configure rotating file logger for this Agent."""
+        # Remove existing handlers if reconfiguring
+        if self.logger:
+            for h in list(self.logger.handlers):
+                self.logger.removeHandler(h)
+                h.close()
+        else:
+            self.logger = logging.getLogger("picolo")
+            self.logger.setLevel(logging.INFO)
+            self.logger.propagate = False
+
+        log_path = self.config.get("log_file")
+        max_size = self.config.get("log_max_size", 5 * 1024 * 1024)
+        backup_count = self.config.get("log_backup_count", 3)
+        handler = RotatingFileHandler(
+            log_path,
+            maxBytes=max_size,
+            backupCount=backup_count,
+            encoding="utf-8"
+        )
+        # Simple formatter: we will pre-format the log line in _log
+        handler.setFormatter(logging.Formatter('%(message)s'))
+        self.logger.addHandler(handler)
+
+    def _init_components(self):
+        self._setup_logger()
+        # In-memory log buffer for fast UI access
+        self.recent_logs = deque(maxlen=1000)
+        self.memory = Memory(self.config["db_path"])
+        self.tools_dir = self.config["tools_dir"]
+        self.tools_dict = load_tools(self.tools_dir)
+        self._add_internal_tools()
+        self.openai_tools = build_openai_tools(self.tools_dict) if self.tools_dict else None
+
+        # Determine active provider configuration
+        provider_id = self.config.get("provider")
+        providers = self.config.get("providers", [])
+        active_provider = None
+        if provider_id:
+            active_provider = next((p for p in providers if p.get("id") == provider_id), None)
+
+        # Resolve API key and base URL: provider-specific overrides top-level
+        api_key = self.config.get("api_key", "")
+        base_url = self.config.get("base_url", "https://api.openai.com/v1")
+        if active_provider:
+            if active_provider.get("api_key"):
+                api_key = active_provider["api_key"]
+            if active_provider.get("base_url"):
+                base_url = active_provider["base_url"]
+
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url=base_url
+        )
+        self.model = self.config.get("model", "gpt-4o-mini")
+        self.session_id = self.config.get("session_id", "default")
+        # Build system prompt from identity files + config
+        project_root = os.path.dirname(self.config_path)
+        identity_parts = []
+        for fname in ["IDENTITY.md", "PROFILE.md", "MEMORY.md"]:
+            fpath = os.path.join(project_root, fname)
+            if os.path.exists(fpath):
+                with open(fpath, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    # Strip YAML frontmatter if present
+                    if content.startswith("---"):
+                        parts = content.split("---", 2)
+                        if len(parts) >= 3:
+                            content = parts[2].strip()
+                        else:
+                            content = content.strip()
+                    identity_parts.append(content)
+        identity_prompt = "\n\n".join(identity_parts) if identity_parts else ""
+        custom_prompt = self.config.get("system_prompt", "")
+        if identity_prompt:
+            if custom_prompt:
+                self.system_prompt = identity_prompt + "\n\n" + custom_prompt
+            else:
+                self.system_prompt = identity_prompt
+        else:
+            self.system_prompt = custom_prompt
+
+    def reload_config(self):
+        with self.lock:
+            self.config = self._load_config()
+            self._init_components()
+
+    def reload_tools(self):
+        with self.lock:
+            self.tools_dict = load_tools(self.config["tools_dir"])
+            self._add_internal_tools()
+            self.openai_tools = build_openai_tools(self.tools_dict) if self.tools_dict else None
+
+    def save_config(self, updates: dict):
+        with self.lock:
+            # Load current
+            current = self._load_config()
+            # Merge updates (simple shallow merge; email nested merge)
+            for key, value in updates.items():
+                if key == "email" and isinstance(value, dict) and isinstance(current.get(key), dict):
+                    current[key].update(value)
+                else:
+                    current[key] = value
+            # Write back
+            with open(self.config_path, "w") as f:
+                json.dump(current, f, indent=2)
+            # Refresh
+            self.config = current
+            self._init_components()
+
+    def get_history(self, session_id: str = None, limit: int = 100) -> List[Dict]:
+        with self.lock:
+            sid = session_id or self.session_id
+            return self.memory.get_history(sid, limit)
+
+    def clear_history(self, session_id: str = None):
+        with self.lock:
+            sid = session_id or self.session_id
+            self.memory.clear_history(sid)
+            self._log("History cleared", {"session_id": sid})
+
+    def chat(self, message: str, session_id: str = None, return_history: bool = False):
+        with self.lock:
+            sid = session_id or self.session_id
+            # Add user message
+            self.memory.add_message(sid, "user", message)
+            self._log("User message", {"session_id": sid, "len": len(message)})
+
+            # Build messages from DB
+            limit = self.config.get("context_limit", 100)
+            messages = self.memory.get_history(sid, limit=limit)
+
+            # Ensure system prompt
+            if self.system_prompt:
+                if not any(m.get("role") == "system" for m in messages):
+                    messages.insert(0, {"role": "system", "content": self.system_prompt})
+                    self.memory.add_message(sid, "system", self.system_prompt)
+
+            # Agent loop with iteration limit to prevent infinite tool-call loops
+            max_iterations = 10
+            final_response = None
+            for iteration in range(max_iterations):
+                # Log the exact prompt being sent to the LLM
+                self._log("LLM request", {"iteration": iteration + 1, "model": self.model, "messages": messages})
+                try:
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        tools=self.openai_tools,
+                        tool_choice="auto" if self.openai_tools else None,
+                        timeout=60  # seconds, prevents hanging on API calls
+                    )
+                except Exception as e:
+                    return f"OpenAI API error: {e}"
+                assistant_msg = response.choices[0].message
+                # Save to memory
+                tool_calls_json = None
+                if assistant_msg.tool_calls:
+                    tool_calls_json = []
+                    for tc in assistant_msg.tool_calls:
+                        tool_calls_json.append({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments
+                            }
+                        })
+                self.memory.add_message(
+                    sid,
+                    role="assistant",
+                    content=assistant_msg.content or "",
+                    tool_calls=tool_calls_json
+                )
+                messages.append(assistant_msg)
+
+                if assistant_msg.tool_calls:
+                    for tc in assistant_msg.tool_calls:
+                        tool_name = tc.function.name
+                        result = None
+                        try:
+                            args = json.loads(tc.function.arguments)
+                        except json.JSONDecodeError as e:
+                            result = f"Error parsing tool arguments: {e}"
+                        if result is None:
+                            if tool_name in self.tools_dict:
+                                try:
+                                    result = self.tools_dict[tool_name]["run"](**args)
+                                except Exception as e:
+                                    result = f"Tool execution error: {e}"
+                            else:
+                                result = f"Error: unknown tool '{tool_name}'"
+                        tool_msg = {
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": str(result),
+                            "name": tool_name
+                        }
+                        messages.append(tool_msg)
+                        self.memory.add_message(
+                            sid,
+                            role="tool",
+                            content=str(result),
+                            tool_call_id=tc.id,
+                            tool_name=tool_name
+                        )
+                    # Continue to next iteration
+                    continue
+                else:
+                    final_response = assistant_msg.content or ""
+                    break
+
+            if final_response is None:
+                final_response = "Error: Maximum tool call iterations exceeded. Please try a simpler request."
+
+            self._log("Assistant response", {"session_id": sid, "len": len(final_response)})
+            if return_history:
+                # Sanitize messages to JSON-serializable dicts
+                clean_messages = self._sanitize_for_log(messages)
+                return final_response, clean_messages
+            else:
+                return final_response
+
+    def _sanitize_for_log(self, obj):
+        """Convert non‑serializable OpenAI message objects into plain dicts."""
+        if isinstance(obj, list):
+            return [self._sanitize_for_log(item) for item in obj]
+        if isinstance(obj, dict):
+            return {k: self._sanitize_for_log(v) for k, v in obj.items()}
+        # Check for OpenAI message objects (has role, content, tool_calls attrs)
+        if hasattr(obj, "role") and hasattr(obj, "content"):
+            d = {"role": obj.role, "content": obj.content}
+            if hasattr(obj, "tool_calls") and obj.tool_calls:
+                d["tool_calls"] = []
+                for tc in obj.tool_calls:
+                    d["tool_calls"].append({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        }
+                    })
+            return d
+        return obj
+
+    def _add_internal_tools(self):
+        """Add built‑in tools that enable self‑extension."""
+        # pip_install: install Python packages
+        def pip_install(package: str, upgrade: bool = False) -> str:
+            import subprocess
+            import sys
+            args = [sys.executable, "-m", "pip", "install"]
+            if upgrade:
+                args.append("--upgrade")
+            args.append(package)
+            try:
+                result = subprocess.run(
+                    args,
+                    capture_output=True,
+                    text=True,
+                    timeout=120
+                )
+                return (
+                    f"exit code: {result.returncode}\n"
+                    f"stdout:\n{result.stdout}\n"
+                    f"stderr:\n{result.stderr}"
+                )
+            except subprocess.TimeoutExpired:
+                return "Error: pip install timed out after 120 seconds"
+            except Exception as e:
+                return f"Error: {e}"
+
+        # reload_tools: reload tool modules from disk
+        def reload_tools() -> str:
+            self.reload_tools()
+            return f"Reloaded tools: {', '.join(self.tools_dict.keys())}"
+
+        # shell_run: execute a shell command
+        def shell_run(command: str, timeout: int = 30) -> str:
+            import subprocess
+            try:
+                result = subprocess.run(
+                    command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout
+                )
+                return (
+                    f"exit code: {result.returncode}\n"
+                    f"stdout:\n{result.stdout}\n"
+                    f"stderr:\n{result.stderr}"
+                )
+            except subprocess.TimeoutExpired:
+                return "Error: command timed out"
+            except Exception as e:
+                return f"Error: {e}"
+
+        # get_tools_dir: return the absolute path to the tools directory
+        def get_tools_dir() -> str:
+            return self.tools_dir
+
+        # get_workdir: return current working directory
+        def get_workdir() -> str:
+            import os
+            return os.getcwd()
+
+        # Define specs (OpenAI function calling format)
+        internal_specs = [
+            {
+                "name": "pip_install",
+                "description": "Install a Python package using pip. Use this to add new dependencies for custom tools. Example: {'name': 'pip_install', 'arguments': {'package': 'requests'}}",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "package": {
+                            "type": "string",
+                            "description": "Package name, e.g., 'requests' or 'numpy~=1.24'"
+                        },
+                        "upgrade": {
+                            "type": "boolean",
+                            "description": "If true, upgrade the package if already installed"
+                        }
+                    },
+                    "required": ["package"]
+                }
+            },
+            {
+                "name": "reload_tools",
+                "description": "Reload all tools from the tools directory. Call this after creating new tool files or modifying existing ones to make them available.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "shell_run",
+                "description": "Execute a shell command and return stdout+stderr. Use with caution; can modify the system. Timeout defaults to 30 seconds.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to execute"
+                        },
+                        "timeout": {
+                            "type": "number",
+                            "description": "Timeout in seconds (default 30)"
+                        }
+                    },
+                    "required": ["command"]
+                }
+            },
+            {
+                "name": "get_tools_dir",
+                "description": "Return the absolute path to the tools directory where custom tools are stored. Use this to know where to place new tool files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "get_workdir",
+                "description": "Return the current working directory of the agent process. Useful for constructing file paths.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        ]
+
+        # Add each to tools_dict if not already present (allow override)
+        for spec in internal_specs:
+            name = spec["name"]
+            if name == "pip_install":
+                run_fn = pip_install
+            elif name == "reload_tools":
+                run_fn = reload_tools
+            elif name == "shell_run":
+                run_fn = shell_run
+            elif name == "get_tools_dir":
+                run_fn = get_tools_dir
+            elif name == "get_workdir":
+                run_fn = get_workdir
+            else:
+                continue
+            if name not in self.tools_dict:
+                self.tools_dict[name] = {"spec": spec, "run": run_fn}
+
+    def _sanitize_for_log(self, obj):
+        """Convert non‑serializable OpenAI message objects into plain dicts."""
+        if isinstance(obj, list):
+            return [self._sanitize_for_log(item) for item in obj]
+        if isinstance(obj, dict):
+            return {k: self._sanitize_for_log(v) for k, v in obj.items()}
+        # Check for OpenAI message objects (has role, content, tool_calls attrs)
+        if hasattr(obj, "role") and hasattr(obj, "content"):
+            d = {"role": obj.role, "content": obj.content}
+            if hasattr(obj, "tool_calls") and obj.tool_calls:
+                d["tool_calls"] = []
+                for tc in obj.tool_calls:
+                    d["tool_calls"].append({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        }
+                    })
+            return d
+        return obj
+
+    def get_recent_logs(self, limit: int = 200) -> List[str]:
+        """Return the last N log lines from the in-memory buffer."""
+        with self.lock:
+            # deque slicing not supported; convert to list and slice
+            return list(self.recent_logs)[-limit:]
+
+    def _log(self, event: str, extra: dict = None):
+        """Write a log line to the rotating file logger and in-memory buffer."""
+        try:
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            line = f"[{timestamp}] {event}"
+            if extra:
+                sanitized = self._sanitize_for_log(extra)
+                line += f" {json.dumps(sanitized, ensure_ascii=False)}"
+            if self.logger:
+                self.logger.info(line)
+            # Store in recent logs buffer (thread-safe: _log called within self.lock)
+            self.recent_logs.append(line)
+        except Exception:
+            pass
+
+    def close(self):
+        with self.lock:
+            self.memory.close()
+            if self.logger:
+                for h in list(self.logger.handlers):
+                    h.close()
+                    self.logger.removeHandler(h)
