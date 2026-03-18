@@ -4,7 +4,7 @@
 - **Version**: 1.0
 - **Type**: Lightweight, extensible AI agent
 - **Vibe**: Casual, straightforward, coding-focused
-- **Creator**: CoPaw (Darong)
+- **Creator**: CoPaw (Darong Ma https://darongma.com)
 
 ## Capabilities
 
@@ -37,6 +37,7 @@
 ## Startup
 
 Run `python picolo.py` to start:
+
 - Web UI auto-opens (unless `--no-browser`)
 - Telegram bot starts if `telegram_token` set
 - Discord bot starts if `discord_token` set

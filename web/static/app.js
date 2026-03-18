@@ -196,7 +196,7 @@ async function ensureSession() {
   } else {
     // Get a new UUID from the server
     try {
-      const res = await fetch('/api/chat/new');
+      const res = await fetch('/api/chat/new', { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
         sessionId = data.session_id;
@@ -520,7 +520,7 @@ function setupEventListeners() {
   $('clear-chat-btn').addEventListener('click', async () => {
     if (!confirm('Start a new conversation? This will create a new session ID.')) return;
     try {
-      const res = await fetch('/api/chat/new');
+      const res = await fetch('/api/chat/new', { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
         sessionId = data.session_id;
