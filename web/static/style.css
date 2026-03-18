@@ -496,6 +496,20 @@ details > div {
   transform: scale(0.98);
 }
 
+/* Inline checkbox styling */
+.form-group.checkbox-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.form-group.checkbox-inline label {
+  margin-bottom: 0;
+}
+.form-group.checkbox-inline input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+}
+
 /* Consistent dropdown (select) styling across the site */
 .config-panel select,
 .config-panel input[type="text"],
