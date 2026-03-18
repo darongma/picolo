@@ -2,7 +2,7 @@
 
 > A lightweight, Python-native AI agent with a built-in web UI, multi-platform bots, and first-class office document support. Zero infrastructure required.
 
----
+![Picolo Bot in Action](./screenshot/picolo.jpg)
 
 ## Why Picolo?
 
