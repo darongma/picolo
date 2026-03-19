@@ -440,8 +440,9 @@ details > div {
   transition: all 0.2s;
 }
 .clear-chat-btn:hover {
-  border-color: var(--primary);
-  color: var(--primary);
+  border-color: white;
+  color: white;
+  background: rgba(255, 255, 255, 0.15);
 }
 
 /* Provider management inline */

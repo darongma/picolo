@@ -89,10 +89,10 @@ async def update_config(request: Request):
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/chat/history")
-def get_history(session_id: str = None, limit: int = 100):
+def get_history(session_id: str = None):
     with agent_lock:
         sid = session_id or agent.session_id
-        history = agent.get_history(sid, limit)
+        history = agent.get_history(sid)  # uses token-based limit from config
         return {"history": history, "session_id": sid}
 
 @app.post("/api/chat/new")

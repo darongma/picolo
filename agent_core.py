@@ -47,7 +47,7 @@ class Memory:
         tool_calls: Optional[List[Dict]] = None,
         tool_call_id: str = None,
         tool_name: str = None
-    ):
+    ) -> str:
         self.conn.execute(
             """
             INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, tool_name)
@@ -63,6 +63,11 @@ class Memory:
             )
         )
         self.conn.commit()
+        # Fetch the timestamp of the inserted row (CURRENT_TIMESTAMP)
+        cur = self.conn.execute("SELECT timestamp FROM messages WHERE rowid = last_insert_rowid()")
+        row = cur.fetchone()
+        timestamp = row[0] if row else None
+        return timestamp
 
     def clear_history(self, session_id: str):
         """Delete all messages for a given session."""
@@ -72,20 +77,41 @@ class Memory:
         )
         self.conn.commit()
 
-    def get_history(self, session_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+    def _estimate_message_tokens(self, msg: dict) -> int:
+        """Rough token estimation: ~1 token per 4 chars of content + function calls."""
+        tokens = 0
+        content = msg.get('content', '')
+        if content:
+            tokens += len(content) // 4
+        tool_calls = msg.get('tool_calls', [])
+        if tool_calls:
+            for tc in tool_calls:
+                fn = tc.get('function', {})
+                tokens += len(fn.get('name', '')) // 4
+                tokens += len(fn.get('arguments', '')) // 4
+        tokens += 5  # overhead for role and message structure
+        return tokens
+
+    def get_history(self, session_id: str, max_tokens: int) -> List[Dict[str, Any]]:
+        """Fetch messages for session, returning the most recent ones that fit within max_tokens."""
+        # Fetch a large number of recent messages (newest first)
+        # We assume 10000 is enough to fill any reasonable token budget
         cur = self.conn.execute(
             """
-            SELECT role, content, tool_calls, tool_call_id, tool_name
+            SELECT role, content, tool_calls, tool_call_id, tool_name, timestamp
             FROM messages
             WHERE session_id = ?
-            ORDER BY id ASC
-            LIMIT ?
+            ORDER BY id DESC
+            LIMIT 10000
             """,
-            (session_id, limit)
+            (session_id,)
         )
-        messages = []
-        for role, content, tool_calls_json, tool_call_id, tool_name in cur.fetchall():
-            msg: Dict[str, Any] = {"role": role, "content": content or ""}
+        rows = cur.fetchall()
+        # Convert to message dicts (newest first)
+        fetched = []
+        for row in rows:
+            role, content, tool_calls_json, tool_call_id, tool_name, timestamp = row
+            msg: Dict[str, Any] = {"role": role, "content": content or "", "timestamp": timestamp}
             if tool_calls_json:
                 try:
                     msg["tool_calls"] = json.loads(tool_calls_json)
@@ -93,11 +119,24 @@ class Memory:
                     pass
             if tool_call_id:
                 msg["tool_call_id"] = tool_call_id
-                # store name for convenience (not part of OpenAI API but useful for us)
                 if tool_name:
                     msg["name"] = tool_name
-            messages.append(msg)
-        return messages
+            fetched.append(msg)
+
+        # Select most recent messages that fit within token budget
+        selected = []
+        current_tokens = 0
+        for msg in fetched:  # iterate newest -> oldest
+            est = self._estimate_message_tokens(msg)
+            if current_tokens + est <= max_tokens:
+                selected.append(msg)
+                current_tokens += est
+            else:
+                # Can't fit this message, skip and continue checking older ones
+                continue
+        # Reverse to chronological order (oldest first) for LLM API
+        selected.reverse()
+        return selected
 
     def close(self):
         self.conn.close()
@@ -177,7 +216,8 @@ class Agent:
         cfg.setdefault("tools_dir", os.path.join(os.path.dirname(self.config_path), "tools"))
         cfg.setdefault("session_id", "default")
         cfg.setdefault("system_prompt", None)
-        cfg.setdefault("context_limit", 100)  # max messages to include in prompt
+        # Token-based context limiting (required)
+        cfg.setdefault("max_input_tokens", 200000)  # default context window
         cfg.setdefault("log_file", os.path.join(os.path.dirname(self.config_path), "picolo.log"))
         cfg.setdefault("log_max_size", 5 * 1024 * 1024)  # 5 MB
         cfg.setdefault("log_backup_count", 3)
@@ -294,10 +334,13 @@ class Agent:
             self.config = current
             self._init_components()
 
-    def get_history(self, session_id: str = None, limit: int = 100) -> List[Dict]:
+    def get_history(self, session_id: str = None, max_tokens: int = None) -> List[Dict]:
+        """Return conversation history, limited by token budget."""
         with self.lock:
             sid = session_id or self.session_id
-            return self.memory.get_history(sid, limit)
+            if max_tokens is None:
+                max_tokens = self.config["max_input_tokens"]
+            return self.memory.get_history(sid, max_tokens=max_tokens)
 
     def clear_history(self, session_id: str = None):
         with self.lock:
@@ -312,15 +355,31 @@ class Agent:
             self.memory.add_message(sid, "user", message)
             self._log("User message", {"session_id": sid, "len": len(message)})
 
-            # Build messages from DB
-            limit = self.config.get("context_limit", 100)
-            messages = self.memory.get_history(sid, limit=limit)
+            # Build messages from DB using token-based limit
+            max_input_tokens = self.config["max_input_tokens"]
+            # Estimate tokens needed for system prompt
+            system_estimate = 0
+            if self.system_prompt:
+                system_estimate = len(self.system_prompt) // 4 + 5
+            available = max_input_tokens - system_estimate
+            if available <= 0:
+                messages = []
+            else:
+                messages = self.memory.get_history(sid, max_tokens=available)
 
             # Ensure system prompt
             if self.system_prompt:
                 if not any(m.get("role") == "system" for m in messages):
-                    messages.insert(0, {"role": "system", "content": self.system_prompt})
-                    self.memory.add_message(sid, "system", self.system_prompt)
+                    system_ts = self.memory.add_message(sid, "system", self.system_prompt)
+                    system_msg = {"role": "system", "content": self.system_prompt, "timestamp": system_ts}
+                    messages.insert(0, system_msg)
+
+            # Trim if still over token limit (safety margin)
+            total = sum(self.memory._estimate_message_tokens(m) for m in messages)
+            idx = 1 if messages and messages[0].get("role") == "system" else 0
+            while total > max_input_tokens and len(messages) > idx:
+                removed = messages.pop(idx)
+                total = sum(self.memory._estimate_message_tokens(m) for m in messages)
 
             # Agent loop with iteration limit to prevent infinite tool-call loops
             max_iterations = 10
@@ -328,10 +387,21 @@ class Agent:
             for iteration in range(max_iterations):
                 # Log the exact prompt being sent to the LLM
                 self._log("LLM request", {"iteration": iteration + 1, "model": self.model, "messages": messages})
+                # Strip internal fields (timestamp) before sending to LLM API
+                api_messages = []
+                for m in messages:
+                    api_msg = {"role": m["role"], "content": m["content"]}
+                    if "tool_calls" in m:
+                        api_msg["tool_calls"] = m["tool_calls"]
+                    if "tool_call_id" in m:
+                        api_msg["tool_call_id"] = m["tool_call_id"]
+                    if "name" in m:
+                        api_msg["name"] = m["name"]
+                    api_messages.append(api_msg)
                 try:
                     response = self.client.chat.completions.create(
                         model=self.model,
-                        messages=messages,
+                        messages=api_messages,
                         tools=self.openai_tools,
                         tool_choice="auto" if self.openai_tools else None,
                         timeout=60  # seconds, prevents hanging on API calls
@@ -352,13 +422,20 @@ class Agent:
                                 "arguments": tc.function.arguments
                             }
                         })
-                self.memory.add_message(
+                assistant_ts = self.memory.add_message(
                     sid,
                     role="assistant",
                     content=assistant_msg.content or "",
                     tool_calls=tool_calls_json
                 )
-                messages.append(assistant_msg)
+                assistant_dict = {
+                    "role": "assistant",
+                    "content": assistant_msg.content or "",
+                    "timestamp": assistant_ts,
+                }
+                if tool_calls_json:
+                    assistant_dict["tool_calls"] = tool_calls_json
+                messages.append(assistant_dict)
 
                 if assistant_msg.tool_calls:
                     for tc in assistant_msg.tool_calls:
@@ -382,14 +459,15 @@ class Agent:
                             "content": str(result),
                             "name": tool_name
                         }
-                        messages.append(tool_msg)
-                        self.memory.add_message(
+                        tool_ts = self.memory.add_message(
                             sid,
                             role="tool",
                             content=str(result),
                             tool_call_id=tc.id,
                             tool_name=tool_name
                         )
+                        tool_msg["timestamp"] = tool_ts
+                        messages.append(tool_msg)
                     # Continue to next iteration
                     continue
                 else:

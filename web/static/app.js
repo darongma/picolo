@@ -55,6 +55,24 @@ async function copyText(text, btn) {
   } catch (e) { console.error('Copy failed:', e); }
 }
 
+// Timestamp formatting
+function formatTimestamp(ts) {
+  if (!ts) return '';
+  // Expected format: "YYYY-MM-DD HH:MM:SS"
+  return ts.substring(0, 16); // "YYYY-MM-DD HH:MM"
+}
+
+function getCurrentTimestamp() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  const hours = String(now.getHours()).padStart(2, '0');
+  const minutes = String(now.getMinutes()).padStart(2, '0');
+  const seconds = String(now.getSeconds()).padStart(2, '0');
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
 // Render a single message
 function renderMessage(msg) {
   const container = $('messages');
@@ -66,26 +84,65 @@ function renderMessage(msg) {
     container.appendChild(toolDiv);
     return;
   }
+
+  const isChat = msg.role === 'user' || msg.role === 'assistant';
+  // Compute message number for chat messages (user/assistant)
+  let messageNumber = '';
+  if (isChat) {
+    const prevChatCount = Array.from(container.children).filter(el => {
+      const cls = el.className || '';
+      return (cls.includes('user') || cls.includes('assistant')) && !cls.includes('welcome');
+    }).length;
+    messageNumber = prevChatCount + 1;
+  }
+
+  const timeStr = formatTimestamp(msg.timestamp);
+
   const div = document.createElement('div');
   div.className = `message ${msg.role}`;
-  // Header with copy button
+
+  // Header with meta info and copy button
   const header = document.createElement('div');
   header.style.display = 'flex';
-  header.style.justifyContent = 'flex-end';
+  header.style.justifyContent = 'space-between';
+  header.style.alignItems = 'center';
   header.style.marginBottom = '4px';
+
+  // Left side: counter and timestamp
+  if (isChat) {
+    const left = document.createElement('span');
+    left.style.fontSize = '0.8rem';
+    left.style.color = 'var(--text-light)';
+    left.style.opacity = '0.8';
+    left.textContent = `#${messageNumber} ${timeStr}`;
+    header.appendChild(left);
+  } else if (timeStr) {
+    // For system or other roles
+    const left = document.createElement('span');
+    left.style.fontSize = '0.8rem';
+    left.style.color = 'var(--text-light)';
+    left.style.opacity = '0.7';
+    left.textContent = timeStr;
+    header.appendChild(left);
+  }
+
+  // Right side: copy button
   const copyBtn = document.createElement('button');
   copyBtn.className = 'copy-btn';
   copyBtn.title = 'Copy';
-  copyBtn.innerHTML = '📋'; // emoji
+  copyBtn.innerHTML = '📋';
   copyBtn.onclick = () => copyText(msg.content || '', copyBtn);
   header.appendChild(copyBtn);
+
   div.appendChild(header);
+
   // Content
   const contentDiv = document.createElement('div');
   contentDiv.className = 'message-content';
   contentDiv.textContent = msg.content || '';
   div.appendChild(contentDiv);
-  // Tool call indicator (if any)
+
+  // Tool call indicator
   if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
     const toolNames = msg.tool_calls.map(tc => tc.function.name).join(', ');
     const toolDiv = document.createElement('div');
@@ -96,6 +153,7 @@ function renderMessage(msg) {
     toolDiv.textContent = `⚙️ Using: ${toolNames}`;
     div.appendChild(toolDiv);
   }
+
   container.appendChild(div);
 }
 
@@ -182,8 +240,8 @@ async function initConfig() {
 function updateSessionDisplay() {
   const display = $('session-id-display');
   if (sessionId) {
-    // Show first 8 chars of UUID for reference
-    display.textContent = `Session: ${sessionId.slice(0, 8)}…`;
+    // Show full session ID
+    display.textContent = `Session: ${sessionId}`;
   } else {
     display.textContent = '';
   }
@@ -225,7 +283,7 @@ function populateConfigForm() {
 
   // Set other fields
   $('system-prompt').value = agentConfig.system_prompt || '';
-  $('context-limit').value = agentConfig.context_limit || 100;
+  $('max-input-tokens').value = agentConfig.max_input_tokens || 200000;
   const email = agentConfig.email || {};
   $('smtp-server').value = email.smtp_server || '';
   $('smtp-port').value = email.smtp_port || 587;
@@ -398,9 +456,41 @@ async function initChat() {
     const data = await res.json();
     $('messages').innerHTML = '';
     if (data.history.length === 0) {
+      const welcomeContent = "Hello! I'm Picolo, your AI assistant. I can help with office documents, web pages, file operations, and more. How can I assist you today?";
       const welcome = document.createElement('div');
-      welcome.className = 'message assistant';
-      welcome.textContent = "Hello! I'm Picolo, your AI assistant. I can help with office documents, web pages, file operations, and more. How can I assist you today?";
+      welcome.className = 'message assistant welcome';
+
+      // Header with timestamp and copy
+      const header = document.createElement('div');
+      header.style.display = 'flex';
+      header.style.justifyContent = 'space-between';
+      header.style.alignItems = 'center';
+      header.style.marginBottom = '4px';
+
+      // Timestamp (left side)
+      const left = document.createElement('span');
+      left.style.fontSize = '0.8rem';
+      left.style.color = 'var(--text-light)';
+      left.style.opacity = '0.8';
+      left.textContent = formatTimestamp(getCurrentTimestamp());
+      header.appendChild(left);
+
+      // Copy button right
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'copy-btn';
+      copyBtn.title = 'Copy';
+      copyBtn.innerHTML = '📋';
+      copyBtn.onclick = () => copyText(welcomeContent, copyBtn);
+      header.appendChild(copyBtn);
+
+      welcome.appendChild(header);
+
+      // Content
+      const contentDiv = document.createElement('div');
+      contentDiv.className = 'message-content';
+      contentDiv.textContent = welcomeContent;
+      welcome.appendChild(contentDiv);
+
       $('messages').appendChild(welcome);
     } else {
       data.history.forEach(renderMessage);
@@ -435,9 +525,46 @@ async function sendMessage() {
 
   try {
     const container = $('messages');
+
+    // Compute message number and timestamp for user message
+    const prevChatCount = Array.from(container.children).filter(el => {
+      const cls = el.className || '';
+      return (cls.includes('user') || cls.includes('assistant')) && !cls.includes('welcome');
+    }).length;
+    const messageNumber = prevChatCount + 1;
+    const timestamp = getCurrentTimestamp();
+    const timeStr = formatTimestamp(timestamp);
+
     const userDiv = document.createElement('div');
     userDiv.className = 'message user';
-    userDiv.textContent = content;
+
+    const header = document.createElement('div');
+    header.style.display = 'flex';
+    header.style.justifyContent = 'space-between';
+    header.style.alignItems = 'center';
+    header.style.marginBottom = '4px';
+
+    const left = document.createElement('span');
+    left.style.fontSize = '0.8rem';
+    left.style.color = 'var(--text-light)';
+    left.style.opacity = '0.8';
+    left.textContent = `#${messageNumber} ${timeStr}`;
+    header.appendChild(left);
+
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'copy-btn';
+    copyBtn.title = 'Copy';
+    copyBtn.innerHTML = '📋';
+    copyBtn.onclick = () => copyText(content, copyBtn);
+    header.appendChild(copyBtn);
+
+    userDiv.appendChild(header);
+
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'message-content';
+    contentDiv.textContent = content;
+    userDiv.appendChild(contentDiv);
+
     container.appendChild(userDiv);
     scrollToBottom();
 
@@ -628,7 +755,7 @@ function setupEventListeners() {
     const updates = {
       provider: provider === 'custom' ? null : provider, // store only if known
       model: $('model').value,
-      context_limit: parseInt($('context-limit').value, 10) || 100,
+      max_input_tokens: parseInt($('max-input-tokens').value, 10) || 200000,
       system_prompt: $('system-prompt').value,
       email: {
         smtp_server: $('smtp-server').value,
