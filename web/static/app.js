@@ -80,7 +80,23 @@ function renderMessage(msg) {
     const toolDiv = document.createElement('div');
     toolDiv.className = 'message tool-result';
     const toolName = msg.name || 'tool';
-    toolDiv.textContent = `🔧 [${toolName}] ${msg.content || ''}`;
+
+    const header = document.createElement('div');
+    header.className = 'tool-header';
+    header.textContent = `Tool Call: ${toolName}`;
+    header.title = "Click to expand/collapse";
+    toolDiv.appendChild(header);
+
+    const body = document.createElement('div');
+    body.className = 'tool-body';
+    body.textContent = msg.content || '';
+    toolDiv.appendChild(body);
+
+    // Smooth expand/collapse via class toggle
+    header.addEventListener('click', () => {
+      toolDiv.classList.toggle('open');
+    });
+
     container.appendChild(toolDiv);
     return;
   }

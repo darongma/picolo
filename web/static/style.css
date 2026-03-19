@@ -187,6 +187,7 @@ body {
   border: 1px solid var(--border);
   border-bottom-left-radius: 4px;
   box-shadow: var(--shadow-sm);
+  min-width: 20%;
 }
 
 .message.system {
@@ -203,18 +204,53 @@ body {
 
 /* Tool call indicator */
 .message.tool-call::before {
-  content: "⚙️ ";
-  font-size: 0.9em;
+  content: "⚙️ Tool Call";
+  font-size: 1.1em;
 }
 .message.tool-result {
-  background: #f0fdf4;
-  border: 1px solid #bbf7d0;
-  color: #166534;
+  background: #f8f9fa;
+  border: 1px solid #e9ecef;
+  border-radius: var(--radius-sm);
+  margin-top: 6px;
+  color: #495057;
+  padding: 0; /* reset outer padding; inner sections handle padding */
+}
+
+.message.tool-result .tool-header {
+  width: 100%;
+  padding: 8px 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+  font-size: 0.9rem;
+  color: inherit;
+  user-select: none;
+  box-sizing: border-box;
+}
+.message.tool-result .tool-header::before {
+  content: "▶";
+  font-size: 0.8em;
+  transition: transform 0.2s;
+  color: inherit;
+}
+.message.tool-result.open .tool-header::before {
+  content: "▼";
+}
+
+.message.tool-result .tool-body {
+  max-height: 0;
+  overflow: hidden;
+  padding: 0 14px; /* keep horizontal padding constant */
   font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
   font-size: 0.9rem;
-  padding: 10px 14px;
-  margin-top: 6px;
-  border-radius: var(--radius-sm);
+  color: inherit;
+  transition: max-height 0.3s ease, padding 0.3s ease;
+}
+.message.tool-result.open .tool-body {
+  max-height: 1000px;
+  padding: 10px 14px; /* add vertical padding on open */
 }
 
 /* Copy button */

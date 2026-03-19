@@ -15,6 +15,22 @@ from typing import Dict, List, Any, Optional
 
 from openai import OpenAI
 
+class PrefixedRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler that names backups as <logname>.<N>.<ext> instead of <logname>.<N>."""
+    def rotation_filename(self, default_name: str) -> str:
+        # Split into directory and filename
+        dir_name, filename = os.path.split(default_name)
+        # Split baseFilename to get its parts
+        _, base_filename = os.path.split(self.baseFilename)
+        if '.' in base_filename:
+            name_root, ext = base_filename.rsplit('.', 1)
+            # Extract number from filename (expected: base_filename + '.' + number)
+            suffix = filename[len(base_filename) + 1:]  # after base_filename and dot
+            new_filename = f"{name_root}.{suffix}.{ext}"
+        else:
+            new_filename = filename
+        return os.path.join(dir_name, new_filename) if dir_name else new_filename
+
 # ==================== Memory ====================
 
 DB_SCHEMA = """
@@ -238,7 +254,7 @@ class Agent:
         log_path = self.config.get("log_file")
         max_size = self.config.get("log_max_size", 5 * 1024 * 1024)
         backup_count = self.config.get("log_backup_count", 3)
-        handler = RotatingFileHandler(
+        handler = PrefixedRotatingFileHandler(
             log_path,
             maxBytes=max_size,
             backupCount=backup_count,
@@ -407,7 +423,8 @@ class Agent:
                         timeout=60  # seconds, prevents hanging on API calls
                     )
                 except Exception as e:
-                    return f"OpenAI API error: {e}"
+                    final_response = f"OpenAI API error: {e}"
+                    break
                 assistant_msg = response.choices[0].message
                 # Save to memory
                 tool_calls_json = None
