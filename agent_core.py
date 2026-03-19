@@ -398,7 +398,7 @@ class Agent:
                 total = sum(self.memory._estimate_message_tokens(m) for m in messages)
 
             # Agent loop with iteration limit to prevent infinite tool-call loops
-            max_iterations = 10
+            max_iterations = self.config.get('max_tool_iterations', 10)
             final_response = None
             for iteration in range(max_iterations):
                 # Log the exact prompt being sent to the LLM

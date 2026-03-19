@@ -6,6 +6,7 @@
   "tools_dir": "tools",
   "session_id": "default",
   "max_input_tokens": 200000,
+  "max_tool_iterations": 50,
   "log_file": "picolo.log",
   "log_max_size": 5242880,
   "log_backup_count": 3,
