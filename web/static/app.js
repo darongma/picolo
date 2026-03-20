@@ -535,6 +535,7 @@ async function sendMessage() {
   autoResize(input);
   sendBtn.disabled = true;
   setTyping(true);
+  document.getElementById("user-input").placeholder="Type a message… ";
   now=new Date().toLocaleString();
   startStatus(agentConfig.provider+" 🤖 "+agentConfig.model+' is working... 🕒 '+now+'…');
 
