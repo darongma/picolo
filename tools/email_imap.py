@@ -83,7 +83,15 @@ tool_specs = [
 ]
 
 # Tool functions
-def email_list(limit=10, search=None):
+def email_list(limit: int = None, search: str = None):
+    if limit is None:
+        config_path = os.path.join(os.path.dirname(__file__), "..", "config.json")
+        try:
+            with open(config_path) as f:
+                cfg = json.load(f)
+            limit = cfg.get('email_imap_default_limit', 10)
+        except Exception:
+            limit = 10
     try:
         server, port, user, pwd, use_ssl = _get_imap_config()
         if use_ssl:

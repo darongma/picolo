@@ -420,7 +420,7 @@ class Agent:
                         messages=api_messages,
                         tools=self.openai_tools,
                         tool_choice="auto" if self.openai_tools else None,
-                        timeout=60  # seconds, prevents hanging on API calls
+                        timeout=self.config.get('llm_timeout_seconds', 60)  # seconds, prevents hanging on API calls
                     )
                 except Exception as e:
                     final_response = f"OpenAI API error: {e}"
@@ -540,7 +540,7 @@ class Agent:
                     args,
                     capture_output=True,
                     text=True,
-                    timeout=120
+                    timeout=self.config.get('pip_install_timeout_seconds', 120)
                 )
                 return (
                     f"exit code: {result.returncode}\n"
@@ -558,8 +558,10 @@ class Agent:
             return f"Reloaded tools: {', '.join(self.tools_dict.keys())}"
 
         # shell_run: execute a shell command
-        def shell_run(command: str, timeout: int = 30) -> str:
+        def shell_run(command: str, timeout: int = None) -> str:
             import subprocess
+            if timeout is None:
+                timeout = self.config.get('shell_timeout_seconds', 30)
             try:
                 result = subprocess.run(
                     command,

@@ -2,7 +2,18 @@
 Shell tool: execute a shell command.
 Adds the ability for the agent to run commands on the host system.
 """
+import os
+import json
 import subprocess
+
+# Load configuration
+CONFIG = {}
+_config_path = os.path.join(os.path.dirname(__file__), "..", "config.json")
+try:
+    with open(_config_path) as f:
+        CONFIG = json.load(f)
+except Exception:
+    CONFIG = {}
 
 tool_spec = {
     "name": "shell",
@@ -13,26 +24,31 @@ tool_spec = {
             "command": {
                 "type": "string",
                 "description": "The shell command to execute."
+            },
+            "timeout": {
+                "type": "number",
+                "description": "Timeout in seconds. Defaults to config.shell_timeout_seconds (or 30)."
             }
         },
         "required": ["command"]
     }
 }
 
-def run(command: str) -> str:
+def run(command: str, timeout: int = None) -> str:
     """Run a shell command safely and capture output."""
+    if timeout is None:
+        timeout = CONFIG.get('shell_timeout_seconds', 30)
     try:
-        # timeout=30 seconds to prevent hangs
         result = subprocess.run(
             command,
             shell=True,
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=timeout
         )
         output = result.stdout + result.stderr
         return output.strip() or "(no output)"
     except subprocess.TimeoutExpired:
-        return "Error: command timed out after 30 seconds"
+        return f"Error: command timed out after {timeout} seconds"
     except Exception as e:
         return f"Error: {e}"

@@ -9,6 +9,15 @@ from email.message import EmailMessage
 from datetime import datetime
 import os
 
+# Load configuration
+CONFIG = {}
+_config_path = os.path.join(os.path.dirname(__file__), "..", "config.json")
+try:
+    with open(_config_path) as f:
+        CONFIG = json.load(f)
+except Exception:
+    CONFIG = {}
+
 tool_specs = [
     {
         "name": "web_get",
@@ -22,7 +31,7 @@ tool_specs = [
                 },
                 "timeout": {
                     "type": "number",
-                    "description": "Timeout in seconds (default: 10)."
+                    "description": "Timeout in seconds. Defaults to config.web_fetch_timeout_seconds (10)."
                 }
             },
             "required": ["url"]
@@ -81,6 +90,10 @@ tool_specs = [
                 "body": {
                     "type": "string",
                     "description": "Plain text body of the email."
+                },
+                "smtp_timeout": {
+                    "type": "number",
+                    "description": "SMTP connection timeout in seconds (default from config)."
                 }
             },
             "required": ["to", "subject", "body"]
@@ -101,7 +114,9 @@ tool_specs = [
     }
 ]
 
-def run_web_get(url: str, timeout: float = 10) -> str:
+def run_web_get(url: str, timeout: float = None) -> str:
+    if timeout is None:
+        timeout = CONFIG.get('web_fetch_timeout_seconds', 10)
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Picolo/1.0'})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -130,22 +145,8 @@ def run_file_append(file_path: str, content: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-def run_send_email_smtp(to: str, subject: str, body: str) -> str:
-    # Expect email config in agent config under 'email' key
-    # Example config:
-    # "email": {
-    #   "smtp_server": "smtp.gmail.com",
-    #   "smtp_port": 587,
-    #   "username": "user@example.com",
-    #   "password": "APP_PASSWORD"
-    # }
+def run_send_email_smtp(to: str, subject: str, body: str, smtp_timeout: float = None) -> str:
     try:
-        # We need to access the agent's config. Since tools are loaded as standalone modules,
-        # we cannot directly access the agent's cfg. We can read config from a known location?
-        # Better: The agent's config could be passed via environment variable or a known file path.
-        # But our tool_spec is static; we need a way to get config.
-        # Option: read config.json from the same directory as picolo.py.
-        # This is a bit hacky but keeps the tool standalone.
         config_path = os.path.join(os.path.dirname(__file__), "..", "config.json")
         if not os.path.exists(config_path):
             return "Error: config.json not found; cannot send email without SMTP configuration"
@@ -161,13 +162,16 @@ def run_send_email_smtp(to: str, subject: str, body: str) -> str:
         if not smtp_server or not username or not password:
             return "Error: incomplete email configuration in config.json"
 
+        if smtp_timeout is None:
+            smtp_timeout = email_cfg.get('smtp_timeout_seconds', 10)
+
         msg = EmailMessage()
         msg["From"] = username
         msg["To"] = to
         msg["Subject"] = subject
         msg.set_content(body)
 
-        with smtplib.SMTP(smtp_server, smtp_port, timeout=10) as server:
+        with smtplib.SMTP(smtp_server, smtp_port, timeout=smtp_timeout) as server:
             server.starttls()
             server.login(username, password)
             server.send_message(msg)
