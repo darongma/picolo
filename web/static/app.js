@@ -535,7 +535,8 @@ async function sendMessage() {
   autoResize(input);
   sendBtn.disabled = true;
   setTyping(true);
-  startStatus('Thinking…');
+  now=new Date().toLocaleString();
+  startStatus(agentConfig.provider+" 🤖 "+agentConfig.model+' is working... 🕒 '+now+'…');
 
   abortController = new AbortController();
 
@@ -592,7 +593,8 @@ async function sendMessage() {
     });
 
     const elapsed = (Date.now() - statusStartTime) / 1000;
-    document.getElementById("user-input").placeholder="Type a message… by the way, "+agentConfig.provider+" "+agentConfig.model+" completed your request in "+elapsed+" seconds."
+    now=new Date().toLocaleString();
+    document.getElementById("user-input").placeholder="Type a message… "+agentConfig.provider+" 🤖 "+agentConfig.model+" completed your last request in 🕒 "+Math.round(elapsed)+" seconds on "+now;
     stopStatus('Done', elapsed);
     setTyping(false);
     abortController = null;
