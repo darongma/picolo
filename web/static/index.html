@@ -25,13 +25,7 @@
 
     <div class="main-content">
       <div class="chat-panel" id="chat-panel">
-        <!-- Status bar (shows progress, timer, cancel) -->
-        <div class="status-bar hidden" id="status-bar">
-          <span id="status-icon">⏳</span>
-          <span id="status-text">Ready</span>
-          <span id="status-timer"></span>
-          <button id="status-cancel" class="status-cancel-btn">Cancel</button>
-        </div>
+        
         <div class="messages" id="messages">
           <!-- Welcome message -->
           <div class="message assistant">
@@ -43,6 +37,13 @@
           <div class="typing-dot"></div>
           <div class="typing-dot"></div>
           <div class="typing-dot"></div>
+          <!-- Status bar (shows progress, timer, cancel) -->
+        <div class="status-bar hidden" id="status-bar">
+          <span id="status-icon">⏳</span>
+          <span id="status-text">Ready</span>
+          <span id="status-timer"></span>
+          <button id="status-cancel" class="status-cancel-btn">Cancel</button>
+        </div>
         </div>
         <div class="input-area">
           <textarea id="user-input" rows="3" placeholder="Type a message…" autocomplete="off"></textarea>

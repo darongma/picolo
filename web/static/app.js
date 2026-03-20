@@ -59,7 +59,7 @@ async function copyText(text, btn) {
 function formatTimestamp(ts) {
   if (!ts) return '';
   // Expected format: "YYYY-MM-DD HH:MM:SS"
-  return ts.substring(0, 16); // "YYYY-MM-DD HH:MM"
+  return ts.substring(0, 19); // "YYYY-MM-DD HH:MM"
 }
 
 function getCurrentTimestamp() {
@@ -592,6 +592,7 @@ async function sendMessage() {
     });
 
     const elapsed = (Date.now() - statusStartTime) / 1000;
+    document.getElementById("user-input").placeholder="Type a message… by the way, "+agentConfig.provider+" "+agentConfig.model+" completed your request in "+elapsed+" seconds."
     stopStatus('Done', elapsed);
     setTyping(false);
     abortController = null;

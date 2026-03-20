@@ -47,8 +47,15 @@ def run(command: str, timeout: int = None) -> str:
             timeout=timeout
         )
         output = result.stdout + result.stderr
-        return output.strip() or "(no output)"
+        # Include the command and exit code in the result for transparency
+        lines = [
+            f"$ {command}",
+            f"[exit code: {result.returncode}]",
+            "",
+            output.strip() if output.strip() else "(no output)"
+        ]
+        return "\n".join(lines)
     except subprocess.TimeoutExpired:
-        return f"Error: command timed out after {timeout} seconds"
+        return f"$ {command}\n[Error: command timed out after {timeout} seconds]"
     except Exception as e:
-        return f"Error: {e}"
+        return f"$ {command}\n[Error: {e}]"

@@ -80,7 +80,7 @@ class Memory:
         )
         self.conn.commit()
         # Fetch the timestamp of the inserted row (CURRENT_TIMESTAMP)
-        cur = self.conn.execute("SELECT timestamp FROM messages WHERE rowid = last_insert_rowid()")
+        cur = self.conn.execute("SELECT datetime(timestamp, 'localtime') as timestamp FROM messages WHERE rowid = last_insert_rowid()")
         row = cur.fetchone()
         timestamp = row[0] if row else None
         return timestamp
@@ -114,7 +114,7 @@ class Memory:
         # We assume 10000 is enough to fill any reasonable token budget
         cur = self.conn.execute(
             """
-            SELECT role, content, tool_calls, tool_call_id, tool_name, timestamp
+            SELECT role, content, tool_calls, tool_call_id, tool_name, datetime(timestamp, 'localtime') as timestamp
             FROM messages
             WHERE session_id = ?
             ORDER BY id DESC
@@ -127,7 +127,7 @@ class Memory:
         fetched = []
         for row in rows:
             role, content, tool_calls_json, tool_call_id, tool_name, timestamp = row
-            msg: Dict[str, Any] = {"role": role, "content": content or "", "timestamp": timestamp}
+            msg: Dict[str, Any] = {"role": role, "content": content, "timestamp": timestamp}
             if tool_calls_json:
                 try:
                     msg["tool_calls"] = json.loads(tool_calls_json)
@@ -148,10 +148,16 @@ class Memory:
                 selected.append(msg)
                 current_tokens += est
             else:
-                # Can't fit this message, skip and continue checking older ones
-                continue
+                # Stop processing if we hit the limit to avoid orphaned tool chains
+                break
+                
         # Reverse to chronological order (oldest first) for LLM API
         selected.reverse()
+        
+        # Safety check: if the oldest message is a tool response without its assistant call, remove it
+        while selected and selected[0].get("role") == "tool":
+            selected.pop(0)
+            
         return selected
 
     def close(self):
@@ -295,6 +301,18 @@ class Agent:
             base_url=base_url
         )
         self.model = self.config.get("model", "gpt-4o-mini")
+        # Detect Gemini provider and init google-genai client.
+        # The OpenAI SDK strips thought_signatures from Gemini responses, causing
+        # 400 errors on multi-turn tool calls. The google-genai SDK preserves them.
+        self.gemini_client = None
+        self.use_gemini_sdk = False
+        if "generativelanguage.googleapis.com" in base_url:
+            try:
+                from google import genai as _google_genai
+                self.gemini_client = _google_genai.Client(api_key=api_key)
+                self.use_gemini_sdk = True
+            except ImportError:
+                pass
         self.session_id = self.config.get("session_id", "default")
         # Build system prompt from identity files + config
         project_root = os.path.dirname(self.config_path)
@@ -383,49 +401,154 @@ class Agent:
             else:
                 messages = self.memory.get_history(sid, max_tokens=available)
 
-            # Ensure system prompt
+            # Ensure system prompt (No database logging here anymore)
             if self.system_prompt:
                 if not any(m.get("role") == "system" for m in messages):
-                    system_ts = self.memory.add_message(sid, "system", self.system_prompt)
-                    system_msg = {"role": "system", "content": self.system_prompt, "timestamp": system_ts}
+                    system_msg = {"role": "system", "content": self.system_prompt}
                     messages.insert(0, system_msg)
 
             # Trim if still over token limit (safety margin)
             total = sum(self.memory._estimate_message_tokens(m) for m in messages)
             idx = 1 if messages and messages[0].get("role") == "system" else 0
             while total > max_input_tokens and len(messages) > idx:
-                removed = messages.pop(idx)
+                messages.pop(idx)
                 total = sum(self.memory._estimate_message_tokens(m) for m in messages)
+                
+            # Clean up orphaned tool messages if we sliced a tool chain in half
+            while len(messages) > idx and messages[idx].get("role") == "tool":
+                messages.pop(idx)
 
             # Agent loop with iteration limit to prevent infinite tool-call loops
             max_iterations = self.config.get('max_tool_iterations', 10)
             final_response = None
+            # For Gemini: store raw Content objects per iteration so thought_signatures
+            # are preserved automatically when passed back in the next request.
+            gemini_contents = None  # built fresh each iteration for Gemini path
             for iteration in range(max_iterations):
                 # Log the exact prompt being sent to the LLM
                 self._log("LLM request", {"iteration": iteration + 1, "model": self.model, "messages": messages})
-                # Strip internal fields (timestamp) before sending to LLM API
-                api_messages = []
-                for m in messages:
-                    api_msg = {"role": m["role"], "content": m["content"]}
-                    if "tool_calls" in m:
-                        api_msg["tool_calls"] = m["tool_calls"]
-                    if "tool_call_id" in m:
-                        api_msg["tool_call_id"] = m["tool_call_id"]
-                    if "name" in m:
-                        api_msg["name"] = m["name"]
-                    api_messages.append(api_msg)
-                try:
-                    response = self.client.chat.completions.create(
-                        model=self.model,
-                        messages=api_messages,
-                        tools=self.openai_tools,
-                        tool_choice="auto" if self.openai_tools else None,
-                        timeout=self.config.get('llm_timeout_seconds', 60)  # seconds, prevents hanging on API calls
-                    )
-                except Exception as e:
-                    final_response = f"OpenAI API error: {e}"
-                    break
-                assistant_msg = response.choices[0].message
+                if self.use_gemini_sdk and self.gemini_client:
+                    # ── Gemini native path ──────────────────────────────────
+                    # We maintain a parallel `gemini_contents` list of raw
+                    # google.genai Content objects. Passing them back directly
+                    # preserves thought_signatures automatically, avoiding the
+                    # 400 INVALID_ARGUMENT error that occurs when the OpenAI SDK
+                    # is used (which strips thought_signature metadata).
+                    try:
+                        from google.genai import types as _gt
+                        import json as _json, uuid as _uuid
+
+                        if gemini_contents is None:
+                            # First iteration: build contents from messages list
+                            gemini_contents = []
+                            system_instruction = None
+                            for m in messages:
+                                role = m["role"]
+                                if role == "system":
+                                    system_instruction = m["content"]
+                                    continue
+                                elif role == "user":
+                                    gemini_contents.append(_gt.Content(
+                                        role="user",
+                                        parts=[_gt.Part(text=m["content"] or "")]
+                                    ))
+                                elif role == "assistant":
+                                    # Plain text assistant message (no tool calls)
+                                    if m.get("content") and not m.get("tool_calls"):
+                                        gemini_contents.append(_gt.Content(
+                                            role="model",
+                                            parts=[_gt.Part(text=m["content"])]
+                                        ))
+                                    # Assistant messages with tool_calls from history
+                                    # are intentionally skipped here — they would need
+                                    # thought_signatures we don't have. The tool result
+                                    # messages that follow are also skipped below.
+                                elif role == "tool":
+                                    # Only include tool results that have a matching
+                                    # assistant tool-call in gemini_contents
+                                    gemini_contents.append(_gt.Content(
+                                        role="user",
+                                        parts=[_gt.Part(
+                                            function_response=_gt.FunctionResponse(
+                                                name=m.get("name") or "tool",
+                                                response={"result": m["content"] or ""}
+                                            )
+                                        )]
+                                    ))
+                        # Build tool declarations
+                        gemini_tools = None
+                        if self.openai_tools:
+                            fn_decls = [
+                                _gt.FunctionDeclaration(
+                                    name=t["function"]["name"],
+                                    description=t["function"].get("description", ""),
+                                    parameters=t["function"].get("parameters")
+                                ) for t in self.openai_tools
+                            ]
+                            gemini_tools = [_gt.Tool(function_declarations=fn_decls)]
+                        gemini_config = _gt.GenerateContentConfig(
+                            system_instruction=system_instruction if iteration == 0 else None,
+                            tools=gemini_tools,
+                            automatic_function_calling=_gt.AutomaticFunctionCallingConfig(disable=True),
+                        )
+                        self._log("Gemini request", {"iteration": iteration + 1, "contents_len": len(gemini_contents)})
+                        gemini_response = self.gemini_client.models.generate_content(
+                            model=self.model,
+                            contents=gemini_contents,
+                            config=gemini_config
+                        )
+                        # Append the raw model Content to gemini_contents so the next
+                        # iteration passes it back with thought_signatures intact
+                        raw_model_content = gemini_response.candidates[0].content
+                        gemini_contents.append(raw_model_content)
+
+                        # Wrap response in a compatible object for the rest of the loop
+                        class _TC:
+                            def __init__(self, id_, name, args_str):
+                                self.id = id_; self.type = "function"
+                                class _F: pass
+                                self.function = _F()
+                                self.function.name = name
+                                self.function.arguments = args_str
+                        class _AM: pass
+                        assistant_msg = _AM()
+                        assistant_msg.content = None
+                        assistant_msg.tool_calls = None
+                        fn_calls = gemini_response.function_calls
+                        if fn_calls:
+                            assistant_msg.tool_calls = [
+                                _TC(str(_uuid.uuid4())[:8], fc.name, _json.dumps(dict(fc.args)))
+                                for fc in fn_calls
+                            ]
+                        else:
+                            assistant_msg.content = gemini_response.text or ""
+                    except Exception as e:
+                        final_response = f"Gemini API error: {e}"
+                        break
+                else:
+                    # ── OpenAI-compatible path ──────────────────────────────
+                    api_messages = []
+                    for m in messages:
+                        api_msg = {"role": m["role"], "content": m["content"] or ""}
+                        if "tool_calls" in m:
+                            api_msg["tool_calls"] = m["tool_calls"]
+                        if "tool_call_id" in m:
+                            api_msg["tool_call_id"] = m["tool_call_id"]
+                        if "name" in m and m["role"] != "tool":
+                            api_msg["name"] = m["name"]
+                        api_messages.append(api_msg)
+                    try:
+                        response = self.client.chat.completions.create(
+                            model=self.model,
+                            messages=api_messages,
+                            tools=self.openai_tools,
+                            tool_choice="auto" if self.openai_tools else None,
+                            timeout=self.config.get('llm_timeout_seconds', 60)
+                        )
+                    except Exception as e:
+                        final_response = f"OpenAI API error: {e}"
+                        break
+                    assistant_msg = response.choices[0].message
                 # Save to memory
                 tool_calls_json = None
                 if assistant_msg.tool_calls:
@@ -485,6 +608,22 @@ class Agent:
                         )
                         tool_msg["timestamp"] = tool_ts
                         messages.append(tool_msg)
+                        # For Gemini path: also append tool result to gemini_contents
+                        # so the next iteration has the full native Content history
+                        if self.use_gemini_sdk and gemini_contents is not None:
+                            try:
+                                from google.genai import types as _gt2
+                                gemini_contents.append(_gt2.Content(
+                                    role="user",
+                                    parts=[_gt2.Part(
+                                        function_response=_gt2.FunctionResponse(
+                                            name=tool_name,
+                                            response={"result": str(result)}
+                                        )
+                                    )]
+                                ))
+                            except Exception:
+                                pass
                     # Continue to next iteration
                     continue
                 else:
@@ -673,29 +812,6 @@ class Agent:
                 continue
             if name not in self.tools_dict:
                 self.tools_dict[name] = {"spec": spec, "run": run_fn}
-
-    def _sanitize_for_log(self, obj):
-        """Convert non‑serializable OpenAI message objects into plain dicts."""
-        if isinstance(obj, list):
-            return [self._sanitize_for_log(item) for item in obj]
-        if isinstance(obj, dict):
-            return {k: self._sanitize_for_log(v) for k, v in obj.items()}
-        # Check for OpenAI message objects (has role, content, tool_calls attrs)
-        if hasattr(obj, "role") and hasattr(obj, "content"):
-            d = {"role": obj.role, "content": obj.content}
-            if hasattr(obj, "tool_calls") and obj.tool_calls:
-                d["tool_calls"] = []
-                for tc in obj.tool_calls:
-                    d["tool_calls"].append({
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    })
-            return d
-        return obj
 
     def get_recent_logs(self, limit: int = 200) -> List[str]:
         """Return the last N log lines from the in-memory buffer."""
