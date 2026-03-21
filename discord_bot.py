@@ -75,7 +75,7 @@ async def on_message(message: discord.Message):
         return
 
     # Command: /new – start a new conversation (clear history)
-    if message.content.strip() == '/new':
+    if message.content.strip() == 'new/':
         session_id = str(message.channel.id)
         try:
             ag = await get_agent()
@@ -97,7 +97,7 @@ async def on_message(message: discord.Message):
             ag = await get_agent()
             # Use DM channel's ID or guild+channel ID as session_id
             session_id = str(message.channel.id)
-            response = await asyncio.to_thread(ag.chat, message.content, session_id)
+            response, total, history = await asyncio.to_thread(ag.chat, message.content, session_id)
             # Discord limit is 2000 chars; split if necessary
             for i in range(0, len(response), 2000):
                 chunk = response[i:i+2000]

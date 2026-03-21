@@ -58,7 +58,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Run agent in a thread to avoid blocking the async loop
     loop = asyncio.get_running_loop()
     try:
-        response = await loop.run_in_executor(None, init_agent().chat, text, chat_id)
+        response, total, history = await loop.run_in_executor(None, init_agent().chat, text, chat_id)
     except Exception as e:
         logger.exception(f"Agent error for chat {chat_id}: {e}")
         response = f"Error: {e}"
@@ -78,7 +78,7 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         agent = init_agent()
         agent.clear_history(chat_id)
-        await update.message.reply_text("New conversation started. Previous messages cleared.")
+        await update.message.reply_text("✅ New conversation started. Previous messages cleared.")
     except Exception as e:
         logger.exception(f"Error clearing history for chat {chat_id}: {e}")
         await update.message.reply_text(f"Error: {e}")

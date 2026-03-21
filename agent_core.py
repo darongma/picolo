@@ -317,7 +317,7 @@ class Agent:
         # Build system prompt from identity files + config
         project_root = os.path.dirname(self.config_path)
         identity_parts = []
-        for fname in ["IDENTITY.md", "PROFILE.md", "MEMORY.md"]:
+        for fname in ["IDENTITY.md", "SOUL.md", "PROFILE.md", "MEMORY.md"]:
             fpath = os.path.join(project_root, fname)
             if os.path.exists(fpath):
                 with open(fpath, "r", encoding="utf-8") as f:
@@ -382,17 +382,19 @@ class Agent:
             self.memory.clear_history(sid)
             self._log("History cleared", {"session_id": sid})
 
+
+
+
     def chat(self, message: str, session_id: str = None, return_history: bool = False):
+        # ── Phase 1: persist user message & build context (needs lock) ──
         with self.lock:
-            new_msgs=[]
+            new_msgs = []
             sid = session_id or self.session_id
-            # Add user message
             self.memory.add_message(sid, "user", message)
             self._log("User message", {"session_id": sid, "len": len(message)})
 
             # Build messages from DB using token-based limit
             max_input_tokens = self.config["max_input_tokens"]
-            # Estimate tokens needed for system prompt
             system_estimate = 0
             if self.system_prompt:
                 system_estimate = len(self.system_prompt) // 4 + 5
@@ -402,205 +404,234 @@ class Agent:
             else:
                 messages = self.memory.get_history(sid, max_tokens=available)
 
-            # Ensure system prompt (No database logging here anymore)
+            # Ensure system prompt
             if self.system_prompt:
                 if not any(m.get("role") == "system" for m in messages):
                     system_msg = {"role": "system", "content": self.system_prompt}
                     messages.insert(0, system_msg)
 
             # Trim if still over token limit (safety margin)
-            total = sum(self.memory._estimate_message_tokens(m) for m in messages)
             idx = 1 if messages and messages[0].get("role") == "system" else 0
+            total = sum(self.memory._estimate_message_tokens(m) for m in messages)
             while total > max_input_tokens and len(messages) > idx:
                 messages.pop(idx)
                 total = sum(self.memory._estimate_message_tokens(m) for m in messages)
-                
+
             # Clean up orphaned tool messages if we sliced a tool chain in half
             while len(messages) > idx and messages[idx].get("role") == "tool":
                 messages.pop(idx)
 
-            # Agent loop with iteration limit to prevent infinite tool-call loops
-            max_iterations = self.config.get('max_tool_iterations', 10)
-            final_response = None
-            # For Gemini: store raw Content objects per iteration so thought_signatures
-            # are preserved automatically when passed back in the next request.
-            gemini_contents = None  # built fresh each iteration for Gemini path
-            for iteration in range(max_iterations):
-                # Log the exact prompt being sent to the LLM
-                self._log("LLM request", {"iteration": iteration + 1, "model": self.model, "messages": messages})
-                if self.use_gemini_sdk and self.gemini_client:
-                    # ── Gemini native path ──────────────────────────────────
-                    # We maintain a parallel `gemini_contents` list of raw
-                    # google.genai Content objects. Passing them back directly
-                    # preserves thought_signatures automatically, avoiding the
-                    # 400 INVALID_ARGUMENT error that occurs when the OpenAI SDK
-                    # is used (which strips thought_signature metadata).
-                    try:
-                        from google.genai import types as _gt
-                        import json as _json, uuid as _uuid
+        # ── Phase 2: agent loop (lock released during LLM calls) ──
+        max_iterations = self.config.get('max_tool_iterations', 25)
+        final_response = None
+        gemini_contents = None
+        # Per-tool error counter for retry loop prevention
+        tool_error_counts = {}
+        max_tool_errors = self.config.get('max_tool_errors', 3)
 
-                        if gemini_contents is None:
-                            # First iteration: build contents from messages list
-                            gemini_contents = []
-                            system_instruction = None
-                            for m in messages:
-                                role = m["role"]
-                                if role == "system":
-                                    system_instruction = m["content"]
+        for iteration in range(max_iterations):
+            self._log("LLM request", {"iteration": iteration + 1, "model": self.model, "messages": messages})
+
+            # ── LLM call (no lock held) ──────────────────────────────────
+            if self.use_gemini_sdk and self.gemini_client:
+                try:
+                    from google.genai import types as _gt
+                    import json as _json, uuid as _uuid
+
+                    if gemini_contents is None:
+                        gemini_contents = []
+                        system_instruction = None
+                        skip_tool_ids = set()  # track tool_call_ids to skip if assistant was skipped
+
+                        for m in messages:
+                            role = m["role"]
+                            if role == "system":
+                                system_instruction = m["content"]
+                                continue
+
+                            elif role == "user":
+                                gemini_contents.append(_gt.Content(
+                                    role="user",
+                                    parts=[_gt.Part(text=m["content"] or "")]
+                                ))
+
+                            elif role == "assistant":
+                                if m.get("content") and not m.get("tool_calls"):
+                                    # Plain text response — safe to include
+                                    gemini_contents.append(_gt.Content(
+                                        role="model",
+                                        parts=[_gt.Part(text=m["content"])]
+                                    ))
+                                elif m.get("tool_calls"):
+                                    # Has tool_calls but no thought_signature (came from DB) —
+                                    # skip it AND mark its tool result IDs to be skipped too,
+                                    # otherwise Gemini sees orphaned tool results with no preceding call
+                                    for tc in m["tool_calls"]:
+                                        skip_tool_ids.add(tc["id"])
+
+                            elif role == "tool":
+                                if m.get("tool_call_id") in skip_tool_ids:
+                                    # Orphaned tool result — its assistant call was skipped, drop it
+                                    skip_tool_ids.discard(m["tool_call_id"])
                                     continue
-                                elif role == "user":
-                                    gemini_contents.append(_gt.Content(
-                                        role="user",
-                                        parts=[_gt.Part(text=m["content"] or "")]
-                                    ))
-                                elif role == "assistant":
-                                    # Plain text assistant message (no tool calls)
-                                    if m.get("content") and not m.get("tool_calls"):
-                                        gemini_contents.append(_gt.Content(
-                                            role="model",
-                                            parts=[_gt.Part(text=m["content"])]
-                                        ))
-                                    # Assistant messages with tool_calls from history
-                                    # are intentionally skipped here — they would need
-                                    # thought_signatures we don't have. The tool result
-                                    # messages that follow are also skipped below.
-                                elif role == "tool":
-                                    # Only include tool results that have a matching
-                                    # assistant tool-call in gemini_contents
-                                    gemini_contents.append(_gt.Content(
-                                        role="user",
-                                        parts=[_gt.Part(
-                                            function_response=_gt.FunctionResponse(
-                                                name=m.get("name") or "tool",
-                                                response={"result": m["content"] or ""}
-                                            )
-                                        )]
-                                    ))
-                        # Build tool declarations
-                        gemini_tools = None
-                        if self.openai_tools:
-                            fn_decls = [
-                                _gt.FunctionDeclaration(
-                                    name=t["function"]["name"],
-                                    description=t["function"].get("description", ""),
-                                    parameters=t["function"].get("parameters")
-                                ) for t in self.openai_tools
-                            ]
-                            gemini_tools = [_gt.Tool(function_declarations=fn_decls)]
-                        gemini_config = _gt.GenerateContentConfig(
-                            system_instruction=system_instruction if iteration == 0 else None,
-                            tools=gemini_tools,
-                            automatic_function_calling=_gt.AutomaticFunctionCallingConfig(disable=True),
-                        )
-                        self._log("Gemini request", {"iteration": iteration + 1, "contents_len": len(gemini_contents)})
-                        gemini_response = self.gemini_client.models.generate_content(
-                            model=self.model,
-                            contents=gemini_contents,
-                            config=gemini_config
-                        )
-                        # Append the raw model Content to gemini_contents so the next
-                        # iteration passes it back with thought_signatures intact
-                        raw_model_content = gemini_response.candidates[0].content
-                        gemini_contents.append(raw_model_content)
+                                gemini_contents.append(_gt.Content(
+                                    role="user",
+                                    parts=[_gt.Part(
+                                        function_response=_gt.FunctionResponse(
+                                            name=m.get("name") or "tool",
+                                            response={"result": m["content"] or ""}
+                                        )
+                                    )]
+                                ))
 
-                        # Wrap response in a compatible object for the rest of the loop
-                        class _TC:
-                            def __init__(self, id_, name, args_str):
-                                self.id = id_; self.type = "function"
-                                class _F: pass
-                                self.function = _F()
-                                self.function.name = name
-                                self.function.arguments = args_str
-                        class _AM: pass
-                        assistant_msg = _AM()
-                        assistant_msg.content = None
-                        assistant_msg.tool_calls = None
-                        fn_calls = gemini_response.function_calls
-                        if fn_calls:
-                            assistant_msg.tool_calls = [
-                                _TC(str(_uuid.uuid4())[:8], fc.name, _json.dumps(dict(fc.args)))
-                                for fc in fn_calls
-                            ]
-                        else:
-                            assistant_msg.content = gemini_response.text or ""
-                    except Exception as e:
-                        final_response = f"Gemini API error: ❗ {e}"
-                        break
-                else:
-                    # ── OpenAI-compatible path ──────────────────────────────
-                    api_messages = []
-                    for m in messages:
-                        api_msg = {"role": m["role"], "content": m["content"] or ""}
-                        if "tool_calls" in m:
-                            api_msg["tool_calls"] = m["tool_calls"]
-                        if "tool_call_id" in m:
-                            api_msg["tool_call_id"] = m["tool_call_id"]
-                        if "name" in m and m["role"] != "tool":
-                            api_msg["name"] = m["name"]
-                        api_messages.append(api_msg)
-                    try:
-                        response = self.client.chat.completions.create(
-                            model=self.model,
-                            messages=api_messages,
-                            tools=self.openai_tools,
-                            tool_choice="auto" if self.openai_tools else None,
-                            timeout=self.config.get('llm_timeout_seconds', 60)
-                        )
-                    except Exception as e:
-                        final_response = f"OpenAI API error: ❗ {e}"
-                        break
-                    assistant_msg = response.choices[0].message
-                # Save to memory
-                tool_calls_json = None
-                if assistant_msg.tool_calls:
-                    tool_calls_json = []
-                    for tc in assistant_msg.tool_calls:
-                        tool_calls_json.append({
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments
-                            }
-                        })
+
+                    gemini_tools = None
+                    if self.openai_tools:
+                        fn_decls = [
+                            _gt.FunctionDeclaration(
+                                name=t["function"]["name"],
+                                description=t["function"].get("description", ""),
+                                parameters=t["function"].get("parameters")
+                            ) for t in self.openai_tools
+                        ]
+                        gemini_tools = [_gt.Tool(function_declarations=fn_decls)]
+
+                    gemini_config = _gt.GenerateContentConfig(
+                        system_instruction=system_instruction if iteration == 0 else None,
+                        tools=gemini_tools,
+                        automatic_function_calling=_gt.AutomaticFunctionCallingConfig(disable=True),
+                    )
+                    self._log("Gemini request", {"iteration": iteration + 1, "contents_len": len(gemini_contents)})
+                    gemini_response = self.gemini_client.models.generate_content(
+                        model=self.model,
+                        contents=gemini_contents,
+                        config=gemini_config
+                    )
+                    raw_model_content = gemini_response.candidates[0].content
+                    gemini_contents.append(raw_model_content)
+
+                    class _TC:
+                        def __init__(self, id_, name, args_str):
+                            self.id = id_; self.type = "function"
+                            class _F: pass
+                            self.function = _F()
+                            self.function.name = name
+                            self.function.arguments = args_str
+                    class _AM: pass
+                    assistant_msg = _AM()
+                    assistant_msg.content = None
+                    assistant_msg.tool_calls = None
+                    fn_calls = gemini_response.function_calls
+                    if fn_calls:
+                        assistant_msg.tool_calls = [
+                            _TC(str(_uuid.uuid4())[:8], fc.name, _json.dumps(dict(fc.args)))
+                            for fc in fn_calls
+                        ]
+                    else:
+                        assistant_msg.content = gemini_response.text or ""
+                except Exception as e:
+                    final_response = f"Gemini API error: ❗ {e}"
+                    break
+            else:
+                api_messages = []
+                for m in messages:
+                    api_msg = {"role": m["role"], "content": m["content"] or ""}
+                    if "tool_calls" in m:
+                        api_msg["tool_calls"] = m["tool_calls"]
+                    if "tool_call_id" in m:
+                        api_msg["tool_call_id"] = m["tool_call_id"]
+                    if "name" in m and m["role"] != "tool":
+                        api_msg["name"] = m["name"]
+                    api_messages.append(api_msg)
+                try:
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=api_messages,
+                        tools=self.openai_tools,
+                        tool_choice="auto" if self.openai_tools else None,
+                        timeout=self.config.get('llm_timeout_seconds', 60)
+                    )
+                except Exception as e:
+                    final_response = f"OpenAI API error: ❗ {e}"
+                    break
+                assistant_msg = response.choices[0].message
+
+            # ── Persist assistant message (re-acquire lock) ──────────────
+            tool_calls_json = None
+            if assistant_msg.tool_calls:
+                tool_calls_json = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        }
+                    }
+                    for tc in assistant_msg.tool_calls
+                ]
+
+            with self.lock:
                 assistant_ts = self.memory.add_message(
                     sid,
                     role="assistant",
                     content=assistant_msg.content or "",
                     tool_calls=tool_calls_json
                 )
-                assistant_dict = {
-                    "role": "assistant",
-                    "content": assistant_msg.content or "",
-                    "timestamp": assistant_ts,
-                }
-                if tool_calls_json:
-                    assistant_dict["tool_calls"] = tool_calls_json
-                messages.append(assistant_dict)
-                new_msgs.append(assistant_dict)
 
-                if assistant_msg.tool_calls:
-                    for tc in assistant_msg.tool_calls:
-                        tool_name = tc.function.name
-                        result = None
+            assistant_dict = {
+                "role": "assistant",
+                "content": assistant_msg.content or "",
+                "timestamp": assistant_ts,
+            }
+            if tool_calls_json:
+                assistant_dict["tool_calls"] = tool_calls_json
+            messages.append(assistant_dict)
+            new_msgs.append(assistant_dict)
+
+            # ── Tool execution branch ────────────────────────────────────
+            if assistant_msg.tool_calls:
+                abort_loop = False
+                for tc in assistant_msg.tool_calls:
+                    tool_name = tc.function.name
+                    result = None
+
+                    # Check if this tool has exceeded its error budget
+                    if tool_error_counts.get(tool_name, 0) >= max_tool_errors:
+                        result = f"Error: tool '{tool_name}' has failed {max_tool_errors} times and has been disabled for this request."
+                        abort_loop = True
+                    else:
                         try:
                             args = json.loads(tc.function.arguments)
                         except json.JSONDecodeError as e:
                             result = f"Error parsing tool arguments: {e}"
+                            tool_error_counts[tool_name] = tool_error_counts.get(tool_name, 0) + 1
+
                         if result is None:
                             if tool_name in self.tools_dict:
                                 try:
                                     result = self.tools_dict[tool_name]["run"](**args)
                                 except Exception as e:
                                     result = f"Tool execution error: {e}"
+                                    tool_error_counts[tool_name] = tool_error_counts.get(tool_name, 0) + 1
+                                    # Check threshold immediately after incrementing
+                                    if tool_error_counts[tool_name] >= max_tool_errors:
+                                        result += f" (tool disabled after {max_tool_errors} failures)"
+                                        abort_loop = True
                             else:
                                 result = f"Error: unknown tool '{tool_name}'"
-                        tool_msg = {
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": str(result),
-                            "name": tool_name
-                        }
+                                # Unknown tool counts as a permanent error — disable immediately
+                                tool_error_counts[tool_name] = max_tool_errors
+                                abort_loop = True
+
+                    tool_msg = {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": str(result),
+                        "name": tool_name
+                    }
+
+                    with self.lock:
                         tool_ts = self.memory.add_message(
                             sid,
                             role="tool",
@@ -608,41 +639,70 @@ class Agent:
                             tool_call_id=tc.id,
                             tool_name=tool_name
                         )
-                        tool_msg["timestamp"] = tool_ts
-                        messages.append(tool_msg)
-                        new_msgs.append(tool_msg)
-                        # For Gemini path: also append tool result to gemini_contents
-                        # so the next iteration has the full native Content history
-                        if self.use_gemini_sdk and gemini_contents is not None:
-                            try:
-                                from google.genai import types as _gt2
-                                gemini_contents.append(_gt2.Content(
-                                    role="user",
-                                    parts=[_gt2.Part(
-                                        function_response=_gt2.FunctionResponse(
-                                            name=tool_name,
-                                            response={"result": str(result)}
-                                        )
-                                    )]
-                                ))
-                            except Exception:
-                                pass
-                    # Continue to next iteration
+
+                    tool_msg["timestamp"] = tool_ts
+                    messages.append(tool_msg)
+                    new_msgs.append(tool_msg)
+
+                    if self.use_gemini_sdk and gemini_contents is not None:
+                        try:
+                            from google.genai import types as _gt2
+                            gemini_contents.append(_gt2.Content(
+                                role="user",
+                                parts=[_gt2.Part(
+                                    function_response=_gt2.FunctionResponse(
+                                        name=tool_name,
+                                        response={"result": str(result)}
+                                    )
+                                )]
+                            ))
+                        except Exception:
+                            pass
+
+                if abort_loop:
+                    # Send one final LLM call so it can summarize/explain the failure
+                    # naturally rather than returning a raw error string to the user.
+                    # We do this by breaking with final_response=None and letting the
+                    # loop continue — but we've already appended the error tool result,
+                    # so the next iteration will get a non-tool response.
                     continue
-                else:
-                    final_response = assistant_msg.content or "⚠️ LLM Gave Empty Response: assistant_msg.content"
-                    break
 
-            if final_response is None:
-                final_response = "❌ Error: Maximum tool call iterations exceeded. Please try a simpler request."
+                continue
 
-            self._log("Assistant response", {"session_id": sid, "len": len(final_response)})
-            if return_history:
-                # Sanitize messages to JSON-serializable dicts
-                clean_messages = self._sanitize_for_log(messages)
             else:
-                clean_messages = self._sanitize_for_log(new_msgs)
-            return final_response, total, clean_messages
+                # ── Final answer ─────────────────────────────────────────
+                final_response = assistant_msg.content or f"⚠️ LLM assistant_msg.content is {repr(assistant_msg.content)}"
+                break
+
+        # ── Phase 3: finalise ────────────────────────────────────────────
+        if final_response is None:
+            final_response = "❌ Error: Maximum tool call iterations exceeded. Please try a simpler request."
+
+        # Recompute total tokens accurately after the full agent loop
+        total = sum(self.memory._estimate_message_tokens(m) for m in messages)
+
+        self._log("Assistant response", {"session_id": sid, "len": len(final_response)})
+
+        if return_history:
+            clean_messages = self._sanitize_for_log(messages)
+        else:
+            clean_messages = self._sanitize_for_log(new_msgs)
+
+        return final_response, total, clean_messages
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def _sanitize_for_log(self, obj):
         """Convert non‑serializable OpenAI message objects into plain dicts."""
