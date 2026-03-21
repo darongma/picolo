@@ -606,10 +606,28 @@ async function sendMessage() {
     }
 
     const data = await res.json();
-    const beforeCount = container.children.length;
+    
+    // Use Optional Chaining (?.) to keep the code clean and crash-proof
+if (data.history?.length > 0 && data.response) {
+  const lastEntry = data.history[data.history.length - 1];
+  
+  // Ensure we are comparing the right field (content vs response)
+  if (data.response !== lastEntry.content) {
+    const now = Date.now();
+    const formatted = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
+    data.history.push({
+      role: "assistant",
+      content: "⛔ " + data.response,
+      timestamp: formatted
+    });
+  }
+}
+    
     /*
+    const beforeCount = container.children.length;
     const newHistory = data.history.slice(beforeCount);
     */
+
     const newHistory = data.history;
     const usedTools = new Set();
     newHistory.forEach(msg => {
