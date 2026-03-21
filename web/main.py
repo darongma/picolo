@@ -118,9 +118,9 @@ async def chat(request: Request):
         raise HTTPException(status_code=400, detail="Message required")
     with agent_lock:
         try:
-            response, history = agent.chat(message, session_id, return_history=True)
+            response, total, history = agent.chat(message, session_id, return_history=True)
             sid = session_id or agent.session_id
-            return {"response": response, "history": history, "session_id": sid}
+            return {"response": response, "tokens":total, "history": history, "session_id": sid}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 

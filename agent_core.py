@@ -627,7 +627,7 @@ class Agent:
                     # Continue to next iteration
                     continue
                 else:
-                    final_response = assistant_msg.content or ""
+                    final_response = assistant_msg.content or "LLM Gave Empty Response"
                     break
 
             if final_response is None:
@@ -637,9 +637,9 @@ class Agent:
             if return_history:
                 # Sanitize messages to JSON-serializable dicts
                 clean_messages = self._sanitize_for_log(messages)
-                return final_response, clean_messages
+                return final_response, total, clean_messages
             else:
-                return final_response
+                return final_response, total
 
     def _sanitize_for_log(self, obj):
         """Convert non‑serializable OpenAI message objects into plain dicts."""

@@ -25,7 +25,7 @@ function toggleTheme() {
 
 // Logs management
 function fetchLogs() {
-  fetch('/api/logs?limit=200')
+  fetch('/api/logs?limit=7')
     .then(res => res.ok ? res.json() : Promise.reject(res))
     .then(data => {
       $('log-content').textContent = data.logs.join('\n');
@@ -36,7 +36,7 @@ function fetchLogs() {
 }
 function startLogsPolling() {
   if (logsInterval) clearInterval(logsInterval);
-  logsInterval = setInterval(fetchLogs, 5000);
+  logsInterval = setInterval(fetchLogs, 60000);
   fetchLogs(); // immediate
 }
 function stopLogsPolling() {
@@ -537,7 +537,7 @@ async function sendMessage() {
   setTyping(true);
   document.getElementById("user-input").placeholder="Type a message… ";
   now=new Date().toLocaleString();
-  startStatus(agentConfig.provider+" 🤖 "+agentConfig.model+' is working... 🕒 '+now+'…');
+  startStatus(agentConfig.provider+" 🤖 "+agentConfig.model+' is working... 📆 '+now+'… 🕒');
 
   abortController = new AbortController();
 
@@ -594,8 +594,6 @@ async function sendMessage() {
     });
 
     const elapsed = (Date.now() - statusStartTime) / 1000;
-    now=new Date().toLocaleString();
-    document.getElementById("user-input").placeholder="Type a message… "+agentConfig.provider+" 🤖 "+agentConfig.model+" completed your last request in 🕒 "+Math.round(elapsed)+" seconds on "+now;
     stopStatus('Done', elapsed);
     setTyping(false);
     abortController = null;
@@ -616,6 +614,10 @@ async function sendMessage() {
         msg.tool_calls.forEach(tc => usedTools.add(tc.function.name));
       }
     });
+
+    now=new Date().toLocaleString();
+    document.getElementById("user-input").placeholder="Type a message… \r\n\r\n"+agentConfig.provider+" 🤖 "+agentConfig.model+" completed your last request with 💰 "+data.tokens+" tokens in 🕒 "+Math.round(elapsed)+" seconds on 📆"+now;
+    
     let finalMsg = 'Done';
     if (usedTools.size > 0) finalMsg += ` (${Array.from(usedTools).join(', ')})`;
     stopStatus(finalMsg, elapsed);
