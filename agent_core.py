@@ -524,7 +524,7 @@ class Agent:
                         else:
                             assistant_msg.content = gemini_response.text or ""
                     except Exception as e:
-                        final_response = f"Gemini API error: {e}"
+                        final_response = f"Gemini API error: ❗ {e}"
                         break
                 else:
                     # ── OpenAI-compatible path ──────────────────────────────
@@ -547,7 +547,7 @@ class Agent:
                             timeout=self.config.get('llm_timeout_seconds', 60)
                         )
                     except Exception as e:
-                        final_response = f"OpenAI API error: {e}"
+                        final_response = f"OpenAI API error: ❗ {e}"
                         break
                     assistant_msg = response.choices[0].message
                 # Save to memory
@@ -630,11 +630,11 @@ class Agent:
                     # Continue to next iteration
                     continue
                 else:
-                    final_response = assistant_msg.content or "LLM Gave Empty Response"
+                    final_response = assistant_msg.content or "⚠️ LLM Gave Empty Response: assistant_msg.content"
                     break
 
             if final_response is None:
-                final_response = "Error: Maximum tool call iterations exceeded. Please try a simpler request."
+                final_response = "❌ Error: Maximum tool call iterations exceeded. Please try a simpler request."
 
             self._log("Assistant response", {"session_id": sid, "len": len(final_response)})
             if return_history:
