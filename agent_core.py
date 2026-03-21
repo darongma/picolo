@@ -384,6 +384,7 @@ class Agent:
 
     def chat(self, message: str, session_id: str = None, return_history: bool = False):
         with self.lock:
+            new_msgs=[]
             sid = session_id or self.session_id
             # Add user message
             self.memory.add_message(sid, "user", message)
@@ -576,6 +577,7 @@ class Agent:
                 if tool_calls_json:
                     assistant_dict["tool_calls"] = tool_calls_json
                 messages.append(assistant_dict)
+                new_msgs.append(assistant_dict)
 
                 if assistant_msg.tool_calls:
                     for tc in assistant_msg.tool_calls:
@@ -608,6 +610,7 @@ class Agent:
                         )
                         tool_msg["timestamp"] = tool_ts
                         messages.append(tool_msg)
+                        new_msgs.append(tool_msg)
                         # For Gemini path: also append tool result to gemini_contents
                         # so the next iteration has the full native Content history
                         if self.use_gemini_sdk and gemini_contents is not None:
@@ -637,9 +640,9 @@ class Agent:
             if return_history:
                 # Sanitize messages to JSON-serializable dicts
                 clean_messages = self._sanitize_for_log(messages)
-                return final_response, total, clean_messages
             else:
-                return final_response, total
+                clean_messages = self._sanitize_for_log(new_msgs)
+            return final_response, total, clean_messages
 
     def _sanitize_for_log(self, obj):
         """Convert non‑serializable OpenAI message objects into plain dicts."""

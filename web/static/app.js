@@ -607,7 +607,10 @@ async function sendMessage() {
 
     const data = await res.json();
     const beforeCount = container.children.length;
+    /*
     const newHistory = data.history.slice(beforeCount);
+    */
+    const newHistory = data.history;
     const usedTools = new Set();
     newHistory.forEach(msg => {
       if (msg.role === 'assistant' && msg.tool_calls) {
